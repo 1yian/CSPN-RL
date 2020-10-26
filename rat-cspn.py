@@ -18,14 +18,15 @@ class CSPN(nn.Module):
         # Map the regions to its log-probability tensor
         self.region_distributions = dict()
 
-        # Map the regions to a parition- a list of children log-prob tensors
+        # Map the regions to a partition- a list of children log-prob tensors
         self.region_products = dict()
 
         self.tensor_list = nn.ModuleList()
         self.output_tensor = None
         self.region_graph_layers = None
+        self.parameter_nn = None
 
-    def make_cspn(self):
+    def make_cspn(self, nn_core, nn_output_size):
         self.region_graph_layers = self.region_graph.make_layers()
         id_counter = 0
         # Make the leaf layer.
@@ -67,16 +68,20 @@ class CSPN(nn.Module):
             id_counter += 1
             self.tensor_list.append(layer)
         self.output_tensor = self.region_distributions[self._region_graph.get_root_region()]
+        self.parameter_nn = ParameterNN(self.tensor_list, nn_core, nn_output_size)
 
     def forward(self, inputs, marginalized=None):
         obj_to_tensor = {}
+        obj_to_params = self.parameter_nn.forward(inputs)
+
         for leaf_tensor_obj in self.tensor_list[0]:
             obj_to_tensor[leaf_tensor_obj] = leaf_tensor_obj.forward(inputs, marginalized)
 
         for layer_idx in range(1, len(self.tensor_list)):
             for tensor_obj in self.vector_list[layer_idx]:
                 input_tensors = [obj_to_tensor[obj] for obj in tensor_obj.inputs]
-                output_tensor = tensor_obj.forward(input_tensors)
+                params = obj_to_params[tensor_obj]
+                output_tensor = tensor_obj.forward(input_tensors, params=params)
                 obj_to_tensor[tensor_obj] = output_tensor
         return obj_to_tensor[self.output_tensor]
 
@@ -85,10 +90,11 @@ class GaussianTensor(nn.Module):
     def __init__(self, region, num_gauss, id):
         self.super.__init__()
         self.id = id
-        self.local_size = len(region)
         self.num_gauss = num_gauss
+        self.scope = sorted(list(region))
 
-    def forward(self, inputs, means, sigmas, marginalized=None):
+    def forward(self, inputs, params, marginalized=None):
+        means, sigmas = params[0], params[1]
         dist = dists.Normal(means, sigmas)
         local_inputs = inputs[: self.scope].unsqueeze(-1)
         # Using the log trick so we're working on the log domain
@@ -117,9 +123,9 @@ class GatingTensor(nn.Module):
         for input in self.inputs:
             assert set(input.scope) == set(self.scope)
 
-    def forward(self, inputs, weights, marginalized=None):
+    def forward(self, inputs, params, marginalized=None):
         # Using the log trick so we're working on the log domain
-        weights = torch.log_softmax(weights, 0)
+        weights = torch.log_softmax(params, 0)
         prods = torch.cat(inputs, 1)
         child_values = prods.unsqueeze(-1) + weights
         sums = torch.logsumexp(child_values, 1)
@@ -144,7 +150,7 @@ class ProductTensor(nn.Module):
         self.scope = list(set(tensor_obj1.scope) | set(tensor_obj2.scope))
         self.size = tensor_obj1.size * tensor_obj2.size
 
-    def forward(self, inputs):
+    def forward(self, inputs, params, marginalized=None):
         dists1 = inputs[0]
         dists2 = inputs[1]
         batch_size = dists1.shape[0]
@@ -191,10 +197,16 @@ class ParameterNN(nn.Module):
         for tensor_obj in tensor_obj_list:
             type = tensor_obj.type()
             if type == NodeTensorType.gaussian:
-                self.param_providers[tensor_obj] = nn.ModuleList([ParamProvider(ParamType.mean, core_output_size),
-                                                                  ParamProvider(ParamType.sigma, core_output_size)])
+                self.param_providers[tensor_obj] = nn.ModuleList(
+                    [nn.ModuleList([ParamProvider(ParamType.mean, core_output_size)
+                                    for _ in range(tensor_obj.num_gauss)]),
+                     nn.ModuleList[[ParamProvider(ParamType.sigma, core_output_size)
+                                    for _ in range(tensor_obj.num_gauss)]]])
             elif type == NodeTensorType.gated:
-                self.param_providers[tensor_obj] = nn.ModuleList([ParamProvider(ParamType.gated, core_output_size)])
+                self.param_providers[tensor_obj] = nn.ModuleList([ParamProvider(ParamType.gated, core_output_size)
+                                                                  for _ in tensor_obj.num_sums])
+            elif type == NodeTensorType.product:
+                self.param_providers[tensor_obj] = nn.ModuleList([])
 
         # Core can be a generic NN that has output size of (batch_size, core_output_size)
         self.core = core
@@ -202,15 +214,23 @@ class ParameterNN(nn.Module):
     def forward(self, input):
         bottleneck = self.core.foward(input)
         outputs = {}
-        for obj in self.param_types:
+        for obj in self.param_providers:
             param_providers = self.param_providers[obj]
+            type = type(obj)
             cur_list = []
-            for i in range(len(param_providers)):
-                cur_provider = param_providers[i]
-                cur_list.append(cur_provider.forward(bottleneck))
-            cur_list = torch.tensor(list(zip(*cur_list)))
-
+            if type == NodeTensorType.gated:
+                for i in range(len(param_providers)):
+                    cur_provider = param_providers[i]
+                    cur_list.append(cur_provider.forward(bottleneck))
+                cur_list = torch.tensor(list(zip(*cur_list)))
+            elif type == NodeTensorType.gaussian:
+                for i in range(len(param_providers)):
+                    param_list = []
+                    for j in range(len(param_providers[i])):
+                        param_list.append(param_providers[i][j].forward(bottleneck))
+                cur_list = torch.stack(*param_list, 0)
             outputs[obj] = cur_list
+
         return outputs
 
 
@@ -229,6 +249,3 @@ class ParamProvider(nn.Module):
         elif self.param_type == ParamType.gated:
             pass
         return output
-
-
-c
