@@ -1,16 +1,16 @@
-# This is a sample Python script.
+import rat_cspn
+import torch
+import torch.nn as nn
+import region_graph
 
-# Press Shift+F10 to execute it or replace it with your code.
-# Press Double Shift to search everywhere for classes, files, tool windows, actions, and settings.
-
-
-def print_hi(name):
-    # Use a breakpoint in the code line below to debug your script.
-    print(f'Hi, {name}')  # Press Ctrl+8 to toggle the breakpoint.
-
-
-# Press the green button in the gutter to run the script.
-if __name__ == '__main__':
-    print_hi('PyCharm')
-
-# See PyCharm help at https://www.jetbrains.com/help/pycharm/
+generic_nn = nn.Sequential(
+    nn.Linear(28 * 28, 128),
+    nn.Linear(128, 64),
+)
+rg = region_graph.RegionGraph(range(28 * 28))
+for _ in range(0, 8):
+    rg.random_split(2, 2)
+cspn = rat_cspn.CSPN(rg)
+cspn.make_cspn(generic_nn, 64)
+test = torch.zeros((0, 28 * 28))
+cspn.forward(test)
