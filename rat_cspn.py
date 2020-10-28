@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.distributions as dists
 import region_graph
 import enum
+import numpy as np
 
 
 class CSPN(nn.Module):
@@ -33,6 +34,7 @@ class CSPN(nn.Module):
         leaf_layer = nn.ModuleList()
         for leaf_region in self.region_graph_layers[0]:
             leaf_tensor = GaussianTensor(leaf_region, num_gauss=self.num_dims, id=id_counter)
+            id_counter += 1
             leaf_layer.append(leaf_tensor)
             self.region_distributions[leaf_region] = leaf_tensor
 
@@ -51,6 +53,7 @@ class CSPN(nn.Module):
                     input1 = self.region_distributions[input_regions[0]]
                     input2 = self.region_distributions[input_regions[1]]
                     product_tensor = ProductTensor(input1, input2, id=id_counter)
+                    id_counter += 1
                     layer.append(product_tensor)
 
                     resulting_region = tuple(sorted(input_regions[0] + input_regions[1]))
@@ -63,9 +66,10 @@ class CSPN(nn.Module):
                 for region in regions:
                     product_tensors = self.region_products[region]
                     sum_tensor = GatingTensor(product_tensors, num_sums, id=id_counter)
+                    id_counter += 1
                     layer.append(sum_tensor)
                     self.region_distributions[region] = sum_tensor
-            id_counter += 1
+
             self.tensor_list.append(layer)
         self.output_tensor = self.region_distributions[self.region_graph.get_root_region()]
         self.parameter_nn = ParameterNN(self.tensor_list, nn_core, nn_output_size)
@@ -79,7 +83,7 @@ class CSPN(nn.Module):
             obj_to_tensor[leaf_tensor_obj] = leaf_tensor_obj.forward(inputs, params, marginalized)
 
         for layer_idx in range(1, len(self.tensor_list)):
-            for tensor_obj in self.vector_list[layer_idx]:
+            for tensor_obj in self.tensor_list[layer_idx]:
                 input_tensors = [obj_to_tensor[obj] for obj in tensor_obj.inputs]
                 params = obj_to_params[tensor_obj]
                 output_tensor = tensor_obj.forward(input_tensors, params=params)
@@ -98,8 +102,7 @@ class GaussianTensor(nn.Module):
     def forward(self, inputs, params, marginalized=None):
         means = params
         dist = dists.Normal(means, torch.ones(means.shape))
-        print(self.scope)
-        local_inputs = inputs.index_select.unsqueeze(-1)
+        local_inputs = torch.index_select(inputs, 1, torch.LongTensor(self.scope)).unsqueeze(-1)
         # Using the log trick so we're working on the log domain
         log_pdf = torch.sum(dist.log_prob(local_inputs), 1)
         return log_pdf
@@ -115,20 +118,22 @@ class GaussianTensor(nn.Module):
 
 
 class GatingTensor(nn.Module):
-    def __init__(self, product_tensors, num_sums, id, gating_function=None):
+    def __init__(self, product_tensors, num_sums, id):
         super().__init__()
         self.inputs = product_tensors
-        self.num_sums = num_sums
-        self.gating_function = gating_function
+
         self.id = id
         self.size = num_sums
         self.scope = self.inputs[0].scope
-        for input in self.inputs:
-            assert set(input.scope) == set(self.scope)
+
+        self.num_inputs = 0
+        for inp in self.inputs:
+            assert set(inp.scope) == set(self.scope)
+            self.num_inputs += inp.size
 
     def forward(self, inputs, params, marginalized=None):
         # Using the log trick so we're working on the log domain
-        weights = torch.log_softmax(params, 0)
+        weights = torch.log_softmax(params, 1)
         prods = torch.cat(inputs, 1)
         child_values = prods.unsqueeze(-1) + weights
         sums = torch.logsumexp(child_values, 1)
@@ -196,22 +201,20 @@ class ParameterNN(nn.Module):
     def __init__(self, tensor_obj_layers, core, core_output_size):
         super().__init__()
         self.param_providers = {}
-        self.tensor_objs = nn.ModuleList()
+        self.param_objs = nn.ModuleList()
         for tensor_obj_layer in tensor_obj_layers:
             for tensor_obj in tensor_obj_layer:
                 type = tensor_obj.type()
-                list = nn.ModuleList()
                 if type == NodeTensorType.gaussian:
-
-                    for _ in range(tensor_obj.size):
-                        param_provider = ParamProvider(ParamType.mean, core_output_size)
-                        list.append(param_provider)
+                    param_provider = ParamProvider(ParamType.mean, core_output_size, tensor_obj.size)
                 elif type == NodeTensorType.gated:
-                    for _ in range(tensor_obj.size):
-                        param_provider = ParamProvider(ParamType.gated, core_output_size)
-                        list.append(param_provider)
-                self.param_providers[tensor_obj] = list
-                self.tensor_objs.append(tensor_obj)
+                    param_provider = ParamProvider(ParamType.gated, core_output_size,
+                                                   tensor_obj.num_inputs * tensor_obj.size)
+                else:
+                    param_provider = None
+
+                self.param_providers[tensor_obj] = param_provider
+                self.param_objs.append(param_provider)
 
         # Core can be a generic NN that has output size of (batch_size, core_output_size)
         self.core = core
@@ -220,23 +223,28 @@ class ParameterNN(nn.Module):
         bottleneck = self.core.forward(input)
         outputs = {}
         for obj in self.param_providers:
-            param_providers = self.param_providers[obj]
+            param_provider = self.param_providers[obj]
             type = obj.type()
-            cur_list = []
-            if type == NodeTensorType.gated or type == NodeTensorType.gaussian:
-                for i in range(len(param_providers)):
-                    cur_provider = param_providers[i]
-                    cur_list.append(cur_provider.forward(bottleneck))
-                cur_list = torch.tensor(list(zip(*cur_list)))
-            outputs[obj] = cur_list
+            params = None
+            if param_provider:
 
+                params = param_provider.forward(bottleneck)
+                if type == NodeTensorType.gaussian:
+                    params = params.view(-1, param_provider.output_size)
+                elif type == NodeTensorType.gated:
+                    params = params.view(-1, obj.num_inputs, obj.size)
+            else:
+                assert (type == NodeTensorType.product)
+            outputs[obj] = params
         return outputs
 
+
 class ParamProvider(nn.Module):
-    def __init__(self, param_type, input_size):
+    def __init__(self, param_type, input_size, output_size):
         super().__init__()
+        self.output_size = output_size
         self.param_type = param_type
-        self.raw_param_layer = nn.Linear(input_size, 1)
+        self.raw_param_layer = nn.Linear(input_size, output_size)
 
     def forward(self, input):
         output = self.raw_param_layer(input)
