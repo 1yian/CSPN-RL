@@ -78,8 +78,9 @@ class CSPN(nn.Module):
 
     def mpe(self, conditional):
         self.forward_mpe(conditional)
-        random_variables = np.zeros()
+        random_variables = np.ones(28)
         self.output_tensor.backwards_mpe(random_variables, 0)
+        return random_variables
 
     def forward_mpe(self, conditional):
         obj_to_tensor = {}
@@ -87,7 +88,7 @@ class CSPN(nn.Module):
 
         for leaf_tensor_obj in self.tensor_list[0]:
             params = obj_to_params[leaf_tensor_obj]
-            obj_to_tensor[leaf_tensor_obj] = leaf_tensor_obj.forward(params, params)
+            obj_to_tensor[leaf_tensor_obj] = leaf_tensor_obj.forward_mpe(params)
 
         for layer_idx in range(1, len(self.tensor_list)):
             for tensor_obj in self.tensor_list[layer_idx]:
@@ -100,7 +101,6 @@ class CSPN(nn.Module):
     def forward(self, inputs, conditional, marginalized=None):
         obj_to_tensor = {}
         obj_to_params = self.parameter_nn.forward(conditional)
-
         for leaf_tensor_obj in self.tensor_list[0]:
             params = obj_to_params[leaf_tensor_obj]
             obj_to_tensor[leaf_tensor_obj] = leaf_tensor_obj.forward(inputs, params, marginalized)
@@ -118,27 +118,49 @@ class GaussianTensor(nn.Module):
     def __init__(self, region, id):
         super().__init__()
         self.id = id
-        self.size = 2
+
         self.scope = sorted(list(region))
         self.num_gauss = len(self.scope)
-
+        self.size = self.num_gauss
+        self.num_means = self.size * self.size
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.to(self.device)
         self.scope_tensor = torch.LongTensor(self.scope).to(self.device)
 
-    def forward(self, inputs, params, marginalized=None):
-        means = params
-        dist = dists.Normal(means, torch.ones(means.shape).to(self.device))
+    def forward(self, inputs, means, marginalized=None):
+        means = means.view(-1, self.size, self.size)
+        identity = torch.eye(self.size).to(self.device).unsqueeze(0)
+        results = []
+        for index in range(self.size):
+            cur_mean = torch.index_select(means, 1, torch.LongTensor([index]).to(self.device)).view(-1, self.size)
+            dist = dists.MultivariateNormal(cur_mean, identity)
+            local_inputs = torch.index_select(inputs, 1, self.scope_tensor)
+            log_probs = dist.log_prob(local_inputs)
+            log_pdf = torch.sum(log_probs, 0)
+            results.append(log_pdf)
+        log_pdf = torch.tensor(results).to(self.device).view(-1, self.size)
+        return log_pdf
 
-        local_inputs = torch.index_select(inputs, 1, self.scope_tensor).unsqueeze(-1)
-        # Using the log trick so we're working on the log domain
-        log_pdf = torch.sum(dist.log_prob(local_inputs), 1)
+    def forward_mpe(self, means, marginalized=None):
+        means = means.view(-1, self.size, self.size)
+        identity = torch.eye(self.size).to(self.device).unsqueeze(0)
+        results = []
+        for index in range(self.size):
+            cur_mean = torch.index_select(means, 1, torch.LongTensor([index]).to(self.device)).view(-1, self.size)
+            dist = dists.MultivariateNormal(cur_mean, identity)
+            local_inputs = torch.index_select(means, 1, torch.LongTensor([index]).to(self.device)).view(-1, self.size)
+            log_probs = dist.log_prob(local_inputs)
+            log_pdf = torch.sum(log_probs, 0)
+            results.append(log_pdf)
         self.dist_argmax = means
+        log_pdf = torch.tensor(results).to(self.device).view(-1, self.size)
         return log_pdf
 
     def backwards_mpe(self, random_variables, node_idx):
-        rv = self.scope_tensor[node_idx].detach().cpu()
-        random_variables[rv] = self.dist_argmax[0][node_idx]
+        i = 0
+        for rv in self.scope_tensor:
+            random_variables[rv] = self.dist_argmax[0][node_idx][i]
+            i += 1
 
     def type(self):
         return NodeTensorType.gaussian
@@ -175,11 +197,11 @@ class GatingTensor(nn.Module):
         sums = torch.logsumexp(child_values, 1)
         return sums
 
-    def backward_mpe(self, random_vars, node_idx):
+    def backwards_mpe(self, random_vars, node_idx):
         max_child_idx = self.max_child_idxs[0][node_idx]
-        prod_tensor_idx = max_child_idx // len(self.inputs)
+        prod_tensor_idx = max_child_idx // self.inputs[0].size
         node_idx = max_child_idx % self.inputs[prod_tensor_idx].size
-        prod_tensor_idx[prod_tensor_idx].backward_mpe(random_vars, node_idx)
+        self.inputs[prod_tensor_idx].backwards_mpe(random_vars, node_idx)
 
     def type(self):
         return NodeTensorType.gated
@@ -221,10 +243,10 @@ class ProductTensor(nn.Module):
         prod = prod.view([batch_size, num_dist1 * num_dist2])
         return prod
 
-    def backward_mpe(self, random_vars, node_idx):
+    def backwards_mpe(self, random_vars, node_idx):
         node = self.child_idx_map[node_idx]
-        self.inputs[0].backward_mpe(random_vars, node[0])
-        self.inputs[1].backward_mpe(random_vars, node[1])
+        self.inputs[0].backwards_mpe(random_vars, node[0])
+        self.inputs[1].backwards_mpe(random_vars, node[1])
 
     def make_child_map(self, size1, size2):
         indices = []
@@ -264,7 +286,7 @@ class ParameterNN(nn.Module):
             for tensor_obj in tensor_obj_layer:
                 type = tensor_obj.type()
                 if type == NodeTensorType.gaussian:
-                    param_provider = ParamProvider(ParamType.mean, core_output_size, tensor_obj.size)
+                    param_provider = ParamProvider(ParamType.mean, core_output_size, tensor_obj.num_means)
                 elif type == NodeTensorType.gated:
                     param_provider = ParamProvider(ParamType.gated, core_output_size,
                                                    tensor_obj.num_inputs * tensor_obj.size)
