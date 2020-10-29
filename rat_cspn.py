@@ -7,8 +7,9 @@ import numpy as np
 
 
 class CSPN(nn.Module):
-    def __init__(self, region_graph):
+    def __init__(self, region_graph, input_size):
         super().__init__()
+        self.input_size = input_size
         self.num_sums = 2
         self.num_leaves = 2
 
@@ -78,9 +79,13 @@ class CSPN(nn.Module):
 
     def mpe(self, conditional):
         self.forward_mpe(conditional)
-        random_variables = np.ones(28)
-        self.output_tensor.backwards_mpe(random_variables, 0)
-        return random_variables
+        batch_rvs = []
+        for batch in range(conditional.shape[0]):
+            self.forward_mpe(conditional[batch].unsqueeze(0))
+            random_variables = torch.zeros(self.input_size).to(self.device)
+            self.output_tensor.backwards_mpe(random_variables, 0)
+            batch_rvs.append(random_variables)
+        return torch.stack(batch_rvs, 0)
 
     def forward_mpe(self, conditional):
         obj_to_tensor = {}
