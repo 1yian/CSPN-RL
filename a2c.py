@@ -2,48 +2,66 @@ import torch
 import torch.nn as nn
 from torch.utils.data.dataloader import DataLoader
 
-class A2C(nn.Module):
 
-    def __init__(self, input_shape, action_dim, core_nn, core_nn_output_size, world_model):
+class CSPN_A2C(nn.Module):
+
+    def __init__(self, input_shape, action_dim, policy_head, value_head, continuous=False):
         super().__init__()
+
+        # Is this A2C acting in a discrete or continuous action space?
+        self.continuous = continuous
+
+        # The shape of the input space. For the purpose of this experiment,
+        # the A2C will take the latent single dimensional vector as its observation.
         self.input_shape = input_shape
+
+        # The output shape will be the action_dim.
+        # Will be one hot-encoded vector in the discrete case, or actual values in the continuous case
         self.output_shape = action_dim
-        self.core_nn = core_nn
-        self.world_model = world_model
-        self.policy_head = nn.Linear(core_nn_output_size, action_dim)
-        self.value_head = nn.Linear(core_nn_output_size, 1)
+
+        # These are our function approximations of the value and policy functions, most likely using a CSPN.
+        # Calling forward or sample on these should give us a batch our the predicted/sampled policies and values
+        # for every input
+        self.policy_head = policy_head
+        self.value_head = value_head
+
+        self.optimizer = torch.optim.Adam(self.parameters(), weight_decay=1e-4, eps=1e-7)
 
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.to(self.device)
 
-        self.optimizer = torch.optim.Adam(self.parameters(), weight_decay=1e-4, eps=1e-7)
+    def forward(self, inputs, sample=False):
+        """
+        Not meant to be used outside of this class/object.
+        @param inputs: the batch of input tensors to predict
+        @param sample: a bool on whether we should pick stochastically or greedily
+        @return: if self.contiuous is true, we return the desired values of each continuous action
+                else return a vector that gives log probabilities of picking each discrete action.
+        """
+        if sample:
+            policy = self.policy_head.sample(inputs)
+            value = self.value_head.sample(inputs)
+        else:
+            policy = self.policy_head.forward_mpe(inputs)
+            value = self.value_head.forward_mpe(inputs)
 
-    def forward(self, x, valid_moves=None):
-        if valid_moves is None:
-            valid_moves = torch.ones(x.shape[0], 4)
-        bottleneck = self.core_nn(x)
-        policy_logits = self.policy_head(bottleneck)
-        self._mask_invalid_actions(policy_logits, valid_moves)
-        value = self.value_head(bottleneck)
-
-        policy = torch.log_softmax(policy_logits, 1)
+        # In the continuous case, we return the raw values predicted or sampled by our CSPN.
+        # In the discrete case, we can log softmax the logits given by our CSPN so that the probs are normalized.
+        if not self.continuous:
+            policy = torch.log_softmax(policy, 1)
         return policy, value
 
-    def select_actions(self, states, greedy):
-
-        probs, _ = self.forward(states)
-        probs = probs.detach().clone().cpu()
-        dist = torch.distributions.categorical.Categorical(probs=probs)
-        actions = dist.sample().numpy() if not greedy else torch.argmax(probs, 1).clone().numpy()
-        action_prob = probs[range(len(actions)), actions]
-        return actions, action_prob
-
-    def _mask_invalid_actions(self, logits, valid_moves):
-        valid_moves = torch.log(valid_moves)
-        min_mask = torch.ones(*valid_moves.size(), dtype=torch.float) * torch.finfo(torch.float).min
-        inf_mask = torch.max(valid_moves, min_mask).to(self.device)
-        # Mask the logits of invalid actions with a number very close to the minimum float number.
-        return logits + inf_mask
+    def select_actions(self, inputs, sample=False):
+        if self.continuous:
+            actions, values = self.forward(inputs, sample)
+            probs = self.policy_head.forward(inputs)
+        else:
+            probs, values = self.forward(inputs, sample)
+            probs = probs.detach().clone().cpu()
+            dist = torch.distributions.categorical.Categorical(probs=probs)
+            actions = dist.sample().numpy() if not sample else torch.argmax(probs, 1).clone().numpy()
+            probs = probs[range(len(actions)), actions]
+        return actions, probs, values
 
     def train_on_loader(self, loader: DataLoader):
         for batch in loader:
@@ -51,21 +69,19 @@ class A2C(nn.Module):
             states, actions, rewards, next_states, action_probs = batch
 
             rewards = rewards.to(self.device)
-            states = self.world_model.encode(states.to(self.device)).detach()
-            policy_log_probs, value = self.forward(states)
+            _, cur_log_probs, values = self.select_actions(states)
 
-            adv = rewards - value.detach()
+            adv = rewards - values.detach()
 
-            log_probs = policy_log_probs[range(len(actions)), actions]
-
-            current_probs = torch.exp(log_probs).clone().detach()
+            current_probs = torch.exp(cur_log_probs).clone().detach()
             importance_sample_ratio = current_probs / action_probs.to(self.device)
 
-            policy_loss = (importance_sample_ratio.detach() * (-adv * log_probs)).mean()
+            policy_loss = (importance_sample_ratio.detach() * (-adv * cur_log_probs)).sum()
 
-            value = value.squeeze(1)
-            value_loss = torch.nn.functional.mse_loss(value, rewards).mean()
+            values = values.squeeze(1)
+            value_loss = torch.nn.functional.mse_loss(values, rewards).sum()
 
-            total_loss = policy_loss + 0.5 * value_loss
+            total_loss = policy_loss + value_loss
+            total_loss = total_loss.mean()
             total_loss.backward()
             self.optimizer.step()

@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torchvision
 from world_model import WorldModel
-from a2c import A2C
+from a2c import CSPN_A2C
 from replay import ExperienceReplayBuffer, collate_experiences
 from torch.utils.data.dataloader import DataLoader
 from torchvision.utils import save_image
@@ -20,7 +20,7 @@ agent_core = nn.Sequential(
 )
 buffer = ExperienceReplayBuffer()
 resize = torchvision.transforms.Resize((32, 32))
-agent = A2C((576), 4, agent_core, 64, world_model)
+agent = CSPN_A2C((576), 4, agent_core, 64, world_model)
 for iter in range(20):
     print("iter", iter)
     for i_episode in range(50):

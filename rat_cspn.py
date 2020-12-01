@@ -7,15 +7,17 @@ import numpy as np
 
 
 class CSPN(nn.Module):
-    def __init__(self, region_graph, input_size):
+    NUM_SUMS = 2
+
+    def __init__(self, rg, input_size, nn_core, nn_output_size, continuous=False):
         super().__init__()
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.input_size = input_size
-        self.num_sums = 2
-        self.num_leaves = 2
 
-        self.num_dims = region_graph.get_num_items()
+        self.num_dims = rg.get_num_items()
+        self.region_graph = rg
 
-        self.region_graph = region_graph
+        self.continuous = continuous
 
         # Map the regions to its log-probability tensor
         self.region_distributions = dict()
@@ -23,16 +25,22 @@ class CSPN(nn.Module):
         # Map the regions to a partition- a list of children log-prob tensors
         self.region_products = dict()
 
+        # A list of all the tensors
         self.tensor_list = nn.ModuleList()
         self.output_tensor = None
-        self.region_graph_layers = None
+        self.region_graph_layers = self.region_graph.make_layers()
+
+        self.nn_core = nn_core
+        self.nn_output_size = nn_output_size
         self.parameter_nn = None
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.make_cspn()
+
         self.to(self.device)
 
-    def make_cspn(self, nn_core, nn_output_size):
-        self.region_graph_layers = self.region_graph.make_layers()
+    def make_cspn(self):
+
         id_counter = 0
+
         # Make the leaf layer.
         leaf_layer = nn.ModuleList()
         for leaf_region in self.region_graph_layers[0]:
@@ -63,7 +71,7 @@ class CSPN(nn.Module):
                     add_to_map(self.region_products, resulting_region, product_tensor)
 
             else:
-                num_sums = self.num_sums if layer_idx != len(self.region_graph_layers) - 1 else 1
+                num_sums = CSPN.NUM_SUMS if layer_idx != len(self.region_graph_layers) - 1 else 1
                 regions = self.region_graph_layers[layer_idx]
 
                 for region in regions:
@@ -75,7 +83,7 @@ class CSPN(nn.Module):
 
             self.tensor_list.append(layer)
         self.output_tensor = self.region_distributions[self.region_graph.get_root_region()]
-        self.parameter_nn = ParameterNN(self.tensor_list, nn_core, nn_output_size)
+        self.parameter_nn = ParameterNN(self.tensor_list, self.nn_core, self.nn_output_size)
 
     def mpe(self, conditional):
         self.forward_mpe(conditional)
@@ -131,6 +139,66 @@ class GaussianTensor(nn.Module):
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.to(self.device)
         self.scope_tensor = torch.LongTensor(self.scope).to(self.device)
+
+    def forward(self, inputs, means, marginalized=None):
+        means = means.view(-1, self.size, self.size)
+        identity = torch.eye(self.size).to(self.device).unsqueeze(0)
+        results = []
+        for index in range(self.size):
+            cur_mean = torch.index_select(means, 1, torch.LongTensor([index]).to(self.device)).view(-1, self.size)
+            dist = dists.MultivariateNormal(cur_mean, identity)
+            local_inputs = torch.index_select(inputs, 1, self.scope_tensor)
+            log_probs = dist.log_prob(local_inputs)
+            log_pdf = torch.sum(log_probs, 0)
+            results.append(log_pdf)
+        log_pdf = torch.tensor(results).to(self.device).view(-1, self.size)
+        return log_pdf
+
+    def forward_mpe(self, means, marginalized=None):
+        means = means.view(-1, self.size, self.size)
+        identity = torch.eye(self.size).to(self.device).unsqueeze(0)
+        results = []
+        for index in range(self.size):
+            cur_mean = torch.index_select(means, 1, torch.LongTensor([index]).to(self.device)).view(-1, self.size)
+            dist = dists.MultivariateNormal(cur_mean, identity)
+            local_inputs = torch.index_select(means, 1, torch.LongTensor([index]).to(self.device)).view(-1, self.size)
+            log_probs = dist.log_prob(local_inputs)
+            log_pdf = torch.sum(log_probs, 0)
+            results.append(log_pdf)
+        self.dist_argmax = means
+        log_pdf = torch.tensor(results).to(self.device).view(-1, self.size)
+        return log_pdf
+
+    def backwards_mpe(self, random_variables, node_idx):
+        i = 0
+        for rv in self.scope_tensor:
+            random_variables[rv] = self.dist_argmax[0][node_idx][i]
+            i += 1
+
+    def type(self):
+        return NodeTensorType.gaussian
+
+    def __hash__(self):
+        return hash(str(self.id))
+
+    def __eq__(self, other):
+        return self.id == other.id
+
+
+class BinaryTensor(nn.Module):
+    def __init__(self, region, id):
+        super().__init__()
+        self.id = id
+
+        self.scope = sorted(list(region))
+        self.num_gauss = len(self.scope)
+        self.size = self.num_gauss
+        self.num_means = self.size * self.size
+
+        self.scope_tensor = torch.LongTensor(self.scope).to(self.device)
+
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.to(self.device)
 
     def forward(self, inputs, means, marginalized=None):
         means = means.view(-1, self.size, self.size)
