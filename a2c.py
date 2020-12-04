@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.utils.data.dataloader import DataLoader
-
+import numpy as np
 
 class CSPN_A2C(nn.Module):
 
@@ -25,7 +25,9 @@ class CSPN_A2C(nn.Module):
         self.policy_head = policy_head
         self.value_head = value_head
 
-        self.optimizer = torch.optim.Adam(self.parameters(), weight_decay=1e-4, eps=1e-7)
+        self.iter = 0
+        self.dreamer_iter = 0
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=1e-5, weight_decay=1e-7, eps=1e-7)
 
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.to(self.device)
@@ -35,53 +37,42 @@ class CSPN_A2C(nn.Module):
         Not meant to be used outside of this class/object.
         @param inputs: the batch of input tensors to predict
         @param sample: a bool on whether we should pick stochastically or greedily
-        @return: if self.contiuous is true, we return the desired values of each continuous action
-                else return a vector that gives log probabilities of picking each discrete action.
+        @return: the values of the inputs that the policy picks, the value of the state, probs: the corresponding
         """
-        if sample:
-            policy = self.policy_head.sample(inputs)
-            value = self.value_head.sample(inputs)
-        else:
-            policy = self.policy_head.forward_mpe(inputs)
-            value = self.value_head.forward_mpe(inputs)
+        policy = self.policy_head.forward_mpe(inputs, sample)
+        value = self.value_head.forward_mpe(inputs, False)
 
-        # In the continuous case, we return the raw values predicted or sampled by our CSPN.
-        # In the discrete case, we can log softmax the logits given by our CSPN so that the probs are normalized.
-        if not self.continuous:
-            policy = torch.log_softmax(policy, 1)
-        return policy, value
+        probs = torch.exp(self.policy_head.forward(policy, inputs))
+        return policy, value, probs
 
-    def select_actions(self, inputs, sample=False):
-        if self.continuous:
-            actions, values = self.forward(inputs, sample)
-            probs = self.policy_head.forward(inputs)
-        else:
-            probs, values = self.forward(inputs, sample)
-            probs = probs.detach().clone().cpu()
-            dist = torch.distributions.categorical.Categorical(probs=probs)
-            actions = dist.sample().numpy() if not sample else torch.argmax(probs, 1).clone().numpy()
-            probs = probs[range(len(actions)), actions]
-        return actions, probs, values
-
-    def train_on_loader(self, loader: DataLoader):
+    def train_on_loader(self, loader: DataLoader, writer, encoder=None):
         for batch in loader:
             self.optimizer.zero_grad()
-            states, actions, rewards, next_states, action_probs = batch
+            states, actions, _, rewards, next_states, action_probs = batch
 
             rewards = rewards.to(self.device)
-            _, cur_log_probs, values = self.select_actions(states)
-
+            if encoder is not None:
+                states = encoder(states).detach()
+            states = states.to(self.device).detach()
+            values = self.value_head.forward_mpe(states, False)
+            cur_log_probs = torch.exp(self.policy_head.forward(actions, states))
             adv = rewards - values.detach()
 
             current_probs = torch.exp(cur_log_probs).clone().detach()
             importance_sample_ratio = current_probs / action_probs.to(self.device)
 
-            policy_loss = (importance_sample_ratio.detach() * (-adv * cur_log_probs)).sum()
-
+            policy_loss = (importance_sample_ratio.detach() * (-adv * cur_log_probs)).mean()
             values = values.squeeze(1)
-            value_loss = torch.nn.functional.mse_loss(values, rewards).sum()
+            value_loss = torch.nn.functional.mse_loss(values, rewards).mean()
 
-            total_loss = policy_loss + value_loss
-            total_loss = total_loss.mean()
+            total_loss = policy_loss.mean() + value_loss.mean()
+            if encoder is not None:
+                writer.add_scalar('A2C/Policy', policy_loss, self.iter)
+                writer.add_scalar('A2C/Value', value_loss, self.iter)
+                self.iter += 1
+            else:
+                writer.add_scalar('Dreamer/Policy', policy_loss, self.dreamer_iter)
+                writer.add_scalar('Dreamer/Value', value_loss, self.dreamer_iter)
+                self.dreamer_iter += 1
             total_loss.backward()
             self.optimizer.step()

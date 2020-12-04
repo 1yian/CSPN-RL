@@ -3,17 +3,17 @@ import torch.nn as nn
 import torch.distributions as dists
 import region_graph
 import enum
-import numpy as np
 
 
 class CSPN(nn.Module):
     NUM_SUMS = 2
 
-    def __init__(self, rg, input_size, nn_core, nn_output_size, continuous=False):
+    def __init__(self, rg: region_graph.RegionGraph, input_size, nn_core, nn_output_size, continuous=False,
+                 rv_domain=[]):
         super().__init__()
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.input_size = input_size
-
+        self.rv_domain = rv_domain
         self.num_dims = rg.get_num_items()
         self.region_graph = rg
 
@@ -29,6 +29,7 @@ class CSPN(nn.Module):
         self.tensor_list = nn.ModuleList()
         self.output_tensor = None
         self.region_graph_layers = self.region_graph.make_layers()
+        print(self.region_graph_layers)
 
         self.nn_core = nn_core
         self.nn_output_size = nn_output_size
@@ -44,7 +45,10 @@ class CSPN(nn.Module):
         # Make the leaf layer.
         leaf_layer = nn.ModuleList()
         for leaf_region in self.region_graph_layers[0]:
-            leaf_tensor = GaussianTensor(leaf_region, id=id_counter)
+            if self.continuous:
+                leaf_tensor = GaussianTensor(leaf_region, id=id_counter)
+            else:
+                leaf_tensor = CategoricalTensor(leaf_region, id_counter, self.rv_domain)
             id_counter += 1
             leaf_layer.append(leaf_tensor)
             self.region_distributions[leaf_region] = leaf_tensor
@@ -85,23 +89,25 @@ class CSPN(nn.Module):
         self.output_tensor = self.region_distributions[self.region_graph.get_root_region()]
         self.parameter_nn = ParameterNN(self.tensor_list, self.nn_core, self.nn_output_size)
 
-    def mpe(self, conditional):
-        self.forward_mpe(conditional)
+    def mpe(self, conditional, sample=False):
+
+        self.forward_mpe(conditional, sample)
         batch_rvs = []
         for batch in range(conditional.shape[0]):
-            self.forward_mpe(conditional[batch].unsqueeze(0))
+
+            self.forward_mpe(conditional[batch].unsqueeze(0), sample)
             random_variables = torch.zeros(self.input_size).to(self.device)
             self.output_tensor.backwards_mpe(random_variables, 0)
             batch_rvs.append(random_variables)
         return torch.stack(batch_rvs, 0)
 
-    def forward_mpe(self, conditional):
+    def forward_mpe(self, conditional, sample=False):
         obj_to_tensor = {}
         obj_to_params = self.parameter_nn.forward(conditional)
-
         for leaf_tensor_obj in self.tensor_list[0]:
             params = obj_to_params[leaf_tensor_obj]
-            obj_to_tensor[leaf_tensor_obj] = leaf_tensor_obj.forward_mpe(params)
+
+            obj_to_tensor[leaf_tensor_obj] = leaf_tensor_obj.forward_mpe(params, sample)
 
         for layer_idx in range(1, len(self.tensor_list)):
             for tensor_obj in self.tensor_list[layer_idx]:
@@ -147,26 +153,34 @@ class GaussianTensor(nn.Module):
         for index in range(self.size):
             cur_mean = torch.index_select(means, 1, torch.LongTensor([index]).to(self.device)).view(-1, self.size)
             dist = dists.MultivariateNormal(cur_mean, identity)
+
             local_inputs = torch.index_select(inputs, 1, self.scope_tensor)
             log_probs = dist.log_prob(local_inputs)
-            log_pdf = torch.sum(log_probs, 0)
-            results.append(log_pdf)
-        log_pdf = torch.tensor(results).to(self.device).view(-1, self.size)
+            results.append(log_probs)
+        log_pdf = torch.stack(results, 1).to(self.device)
         return log_pdf
 
-    def forward_mpe(self, means, marginalized=None):
+    def forward_mpe(self, means, sample=False, marginalized=None):
+
         means = means.view(-1, self.size, self.size)
         identity = torch.eye(self.size).to(self.device).unsqueeze(0)
         results = []
+        self.dist_argmax = []
         for index in range(self.size):
+
             cur_mean = torch.index_select(means, 1, torch.LongTensor([index]).to(self.device)).view(-1, self.size)
             dist = dists.MultivariateNormal(cur_mean, identity)
-            local_inputs = torch.index_select(means, 1, torch.LongTensor([index]).to(self.device)).view(-1, self.size)
+            input = means
+
+            local_inputs = torch.index_select(input, 1, torch.LongTensor([index]).to(self.device)).view(-1, self.size)
+            if sample:
+                local_inputs = dist.sample()
             log_probs = dist.log_prob(local_inputs)
-            log_pdf = torch.sum(log_probs, 0)
-            results.append(log_pdf)
-        self.dist_argmax = means
-        log_pdf = torch.tensor(results).to(self.device).view(-1, self.size)
+            results.append(log_probs)
+            self.dist_argmax.append(local_inputs)
+        self.dist_argmax = torch.stack(self.dist_argmax, 1)
+
+        log_pdf = torch.stack(results, 1).to(self.device)
         return log_pdf
 
     def backwards_mpe(self, random_variables, node_idx):
@@ -185,58 +199,50 @@ class GaussianTensor(nn.Module):
         return self.id == other.id
 
 
-class BinaryTensor(nn.Module):
-    def __init__(self, region, id):
+class CategoricalTensor(nn.Module):
+    def __init__(self, region, id, domain):
         super().__init__()
         self.id = id
 
+        # The domain of the RV(s) eg. (x is an element of [1, 2, 3, 4]) or something
+        self.domain = domain
         self.scope = sorted(list(region))
-        self.num_gauss = len(self.scope)
-        self.size = self.num_gauss
-        self.num_means = self.size * self.size
-
-        self.scope_tensor = torch.LongTensor(self.scope).to(self.device)
+        self.size = len(region)
 
         self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.scope_tensor = torch.LongTensor(self.scope).to(self.device)
         self.to(self.device)
 
-    def forward(self, inputs, means, marginalized=None):
-        means = means.view(-1, self.size, self.size)
-        identity = torch.eye(self.size).to(self.device).unsqueeze(0)
-        results = []
-        for index in range(self.size):
-            cur_mean = torch.index_select(means, 1, torch.LongTensor([index]).to(self.device)).view(-1, self.size)
-            dist = dists.MultivariateNormal(cur_mean, identity)
-            local_inputs = torch.index_select(inputs, 1, self.scope_tensor)
-            log_probs = dist.log_prob(local_inputs)
-            log_pdf = torch.sum(log_probs, 0)
-            results.append(log_pdf)
-        log_pdf = torch.tensor(results).to(self.device).view(-1, self.size)
-        return log_pdf
+    def forward(self, inputs, log_probs, marginalized=None):
+        log_probs = log_probs.view(-1, self.size, len(self.domain))
+        log_probs = torch.log_softmax(log_probs, 2).cpu()
+        inputs = inputs.cpu()
+        inputs = inputs.long()
 
-    def forward_mpe(self, means, marginalized=None):
-        means = means.view(-1, self.size, self.size)
-        identity = torch.eye(self.size).to(self.device).unsqueeze(0)
-        results = []
-        for index in range(self.size):
-            cur_mean = torch.index_select(means, 1, torch.LongTensor([index]).to(self.device)).view(-1, self.size)
-            dist = dists.MultivariateNormal(cur_mean, identity)
-            local_inputs = torch.index_select(means, 1, torch.LongTensor([index]).to(self.device)).view(-1, self.size)
-            log_probs = dist.log_prob(local_inputs)
-            log_pdf = torch.sum(log_probs, 0)
-            results.append(log_pdf)
-        self.dist_argmax = means
-        log_pdf = torch.tensor(results).to(self.device).view(-1, self.size)
-        return log_pdf
+        log_probs = torch.index_select(log_probs, 2, inputs[0])
+        return log_probs.to(self.device)
+
+    def forward_mpe(self, log_probs, sample=False, marginalized=None):
+
+        log_probs = log_probs.view(-1, self.size, len(self.domain))
+        log_probs = torch.log_softmax(log_probs, 2)
+        input = torch.argmax(log_probs, 2).view(-1, self.size)
+        if sample:
+            dist = dists.Categorical(probs=torch.exp(log_probs))
+            input = dist.sample()
+            log_probs = dist.log_prob(input)
+        else:
+            log_probs = torch.max(log_probs, 2).values.view(-1, self.size)
+        self.dist_argmax = input
+
+        return log_probs
 
     def backwards_mpe(self, random_variables, node_idx):
-        i = 0
         for rv in self.scope_tensor:
-            random_variables[rv] = self.dist_argmax[0][node_idx][i]
-            i += 1
+            random_variables[0] = self.dist_argmax[0][node_idx]
 
     def type(self):
-        return NodeTensorType.gaussian
+        return NodeTensorType.categorical
 
     def __hash__(self):
         return hash(str(self.id))
@@ -263,11 +269,13 @@ class GatingTensor(nn.Module):
 
     def forward(self, inputs, params, marginalized=None):
         # Using the log trick so we're working on the log domain
+        print("hi")
         weights = torch.log_softmax(params, 1)
         prods = torch.cat(inputs, 1)
         child_values = prods.unsqueeze(-1) + weights
         self.max_child_idxs = torch.argmax(child_values, axis=1)
         sums = torch.logsumexp(child_values, 1)
+        print(sums, self.inputs[0].id)
         return sums
 
     def backwards_mpe(self, random_vars, node_idx):
@@ -302,6 +310,7 @@ class ProductTensor(nn.Module):
     def forward(self, inputs, params, marginalized=None):
         dists1 = inputs[0]
         dists2 = inputs[1]
+
         batch_size = dists1.shape[0]
         num_dist1 = int(dists1.shape[1])
         num_dist2 = int(dists2.shape[1])
@@ -309,6 +318,7 @@ class ProductTensor(nn.Module):
         # we take the outer product via broadcasting, thus expand in different dims
         dists1_expand = dists1.unsqueeze(1)
         dists2_expand = dists2.unsqueeze(2)
+
 
         # Using the log trick so we're working on the log domain
         prod = dists1_expand + dists2_expand
@@ -342,12 +352,14 @@ class NodeTensorType(enum.Enum):
     gaussian = 0
     product = 1
     gated = 2
+    categorical = 3
 
 
 class ParamType(enum.Enum):
     mean = 0
     sigma = 1
     gated = 2
+    log_prob = 3
 
 
 class ParameterNN(nn.Module):
@@ -363,9 +375,11 @@ class ParameterNN(nn.Module):
                 elif type == NodeTensorType.gated:
                     param_provider = ParamProvider(ParamType.gated, core_output_size,
                                                    tensor_obj.num_inputs * tensor_obj.size)
+                elif type == NodeTensorType.categorical:
+                    param_provider = ParamProvider(ParamType.log_prob, core_output_size, len(tensor_obj.domain) *
+                                                   tensor_obj.size)
                 else:
                     param_provider = None
-
                 self.param_providers[tensor_obj] = param_provider
                 self.param_objs.append(param_provider)
 
@@ -388,6 +402,8 @@ class ParameterNN(nn.Module):
                     params = params.view(-1, param_provider.output_size)
                 elif type == NodeTensorType.gated:
                     params = params.view(-1, obj.num_inputs, obj.size)
+                elif type == NodeTensorType.categorical:
+                    params = params.view(-1, obj.size, len(obj.domain))
             else:
                 assert (type == NodeTensorType.product)
             outputs[obj] = params
@@ -410,5 +426,7 @@ class ParamProvider(nn.Module):
         elif self.param_type == ParamType.sigma:
             pass
         elif self.param_type == ParamType.gated:
+            pass
+        elif self.param_type == ParamType.log_prob:
             pass
         return output

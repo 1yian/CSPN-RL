@@ -12,9 +12,11 @@ class BellmanDiscount:
 
     def discount(self, episode):
         running_return = 0
+        if len(episode) != 0:
+            episode[-1]['discounted_reward'] = episode[-1]['reward']
         for exp in reversed(episode):
-            running_return = exp['reward'] + self.gamma * running_return
-            exp['reward'] = running_return
+            running_return = exp['discounted_reward'] + self.gamma * running_return
+            exp['discounted_reward'] = running_return
         return episode
 
 
@@ -48,16 +50,19 @@ def collate_experiences(experiences):
     batch_actions = []
     batch_probs = []
     batch_rewards = []
+    batch_discounted_rewards = []
     batch_next_states = []
     for exp in experiences:
         batch_states.append(exp['state'])
         batch_actions.append(exp['action'])
         batch_rewards.append(exp['reward'])
+        batch_discounted_rewards.append(exp['discounted_reward'])
         batch_probs.append(exp['action_prob'])
         batch_next_states.append(exp['next_state'])
     state_tensor = torch.cat(batch_states)
     action_tensor = torch.LongTensor(batch_actions)
     reward_tensor = torch.Tensor(batch_rewards)
+    discounted_reward_tensor = torch.Tensor(batch_discounted_rewards)
     action_prob_tensor = torch.Tensor(batch_probs)
     next_state_tensor = torch.cat(batch_next_states)
-    return state_tensor, action_tensor, reward_tensor, next_state_tensor, action_prob_tensor
+    return state_tensor, action_tensor, reward_tensor, discounted_reward_tensor, next_state_tensor, action_prob_tensor
